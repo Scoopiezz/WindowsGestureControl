@@ -72,7 +72,7 @@ residual_move_x_px, residual_move_y_px = 0.0, 0.0
 # --- Gesture detection helpers ---
 # Tune these while watching the debug overlay.
 FINGER_UP_MARGIN = 0.015 # Minimum distance in y between fingertip and pip joint to be considered "up". Adjust for camera distance. 
-PINCH_THRESHOLD = 0.45 # Maximum normalized distance between index fingertip and thumb tip to be considered a pinch. Adjust for camera distance.
+PINCH_THRESHOLD = 0.25 # Maximum normalized distance between index fingertip and thumb tip to be considered a pinch. Adjust for camera distance. history: 0.45 -> 0.25,
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
 
 
@@ -134,6 +134,25 @@ def reset_kalman_to(x, y):
     kalman.errorCovPre = np.eye(4, dtype=np.float32)
     kalman.errorCovPost = np.eye(4, dtype=np.float32)
 
+
+def clamp01(value):
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def draw_debug_hud(frame, lines):
+    panel_width = 390
+    panel_height = 24 + (len(lines) * 22)
+    x0, y0 = 10, 10
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_width, y0 + panel_height), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    y = y0 + 22
+    for line in lines:
+        cv2.putText(frame, line, (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 255, 230), 1)
+        y += 22
+
 # --- Setup logging ---
 logging.basicConfig(
     filename="air_mouse.log",
@@ -179,8 +198,12 @@ last_log_time = time.time()
 last_logged_mouse_position = None  # Track the last logged mouse position
 
 # --- Gesture action cooldowns ---
-last_click_time = 0.0
-CLICK_COOLDOWN = 0.35
+CLICK_COOLDOWN = 0.5
+last_left_click_time = 0.0
+last_right_click_time = 0.0
+is_dragging = False
+prev_index_up = False
+prev_middle_up = False
 
 while True:
     try:
@@ -208,26 +231,124 @@ while True:
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
             gesture_features = get_gesture_features(hand)
 
-            # Debug view for learning and tuning custom gestures.
-            debug_text = (
-                f"I:{int(gesture_features['index_up'])} "
-                f"M:{int(gesture_features['middle_up'])} "
-                f"R:{int(gesture_features['ring_up'])} "
-                f"P:{int(gesture_features['pinky_up'])} "
-                f"Pinch:{int(gesture_features['pinch_index_thumb'])} "
-                f"FistScore:{gesture_features['fist_score']:.2f}"
+            margin = max(FINGER_UP_MARGIN, 1e-6)
+
+            index_ext_score_raw = (hand.landmark[6].y - hand.landmark[8].y) / margin
+            middle_ext_score_raw = (hand.landmark[10].y - hand.landmark[12].y) / margin
+            ring_ext_score_raw = (hand.landmark[14].y - hand.landmark[16].y) / margin
+            pinky_ext_score_raw = (hand.landmark[18].y - hand.landmark[20].y) / margin
+
+            index_curl_score_raw = (hand.landmark[8].y - hand.landmark[6].y) / margin
+            middle_curl_score_raw = (hand.landmark[12].y - hand.landmark[10].y) / margin
+            ring_curl_score_raw = (hand.landmark[16].y - hand.landmark[14].y) / margin
+            pinky_curl_score_raw = (hand.landmark[20].y - hand.landmark[18].y) / margin
+
+            index_ext_score = clamp01(index_ext_score_raw)
+            middle_ext_score = clamp01(middle_ext_score_raw)
+            ring_curl_score = clamp01(ring_curl_score_raw)
+            pinky_curl_score = clamp01(pinky_curl_score_raw)
+            index_curl_score = clamp01(index_curl_score_raw)
+            middle_curl_score = clamp01(middle_curl_score_raw)
+
+            pinch_dist = normalized_distance(hand, 4, 8)
+
+            movement_pose = (
+                gesture_features["index_up"]
+                and gesture_features["middle_up"]
+                and not gesture_features["ring_up"]
+                and not gesture_features["pinky_up"]
             )
-            cv2.putText(frame, debug_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            left_tap_pose = (
+                not gesture_features["index_up"]
+                and gesture_features["middle_up"]
+                and not gesture_features["ring_up"]
+                and not gesture_features["pinky_up"]
+            )
+            right_tap_pose = (
+                gesture_features["index_up"]
+                and not gesture_features["middle_up"]
+                and not gesture_features["ring_up"]
+                and not gesture_features["pinky_up"]
+            )
+
+            movement_score = (index_ext_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+            left_tap_score = (index_curl_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+            right_tap_score = (middle_curl_score + index_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+
+            pinch_score = clamp01((PINCH_THRESHOLD - pinch_dist) / max(PINCH_THRESHOLD, 1e-6))
+            fist_active = is_fist_closed(hand, gesture_features)
+
+            hud_lines = [
+                f"move score={movement_score:.2f} active={int(movement_pose)}",
+                f"left_tap score={left_tap_score:.2f} active={int(left_tap_pose)}",
+                f"right_tap score={right_tap_score:.2f} active={int(right_tap_pose)}",
+                f"pinch score={pinch_score:.2f} active={int(gesture_features['pinch_index_thumb'])}",
+                f"fist score={gesture_features['fist_score']:.2f} active={int(fist_active)}",
+                f"drag active={int(is_dragging)}",
+                f"index_ext={index_ext_score_raw:.2f} active={int(gesture_features['index_up'])}",
+                f"middle_ext={middle_ext_score_raw:.2f} active={int(gesture_features['middle_up'])}",
+                f"ring_ext={ring_ext_score_raw:.2f} active={int(gesture_features['ring_up'])}",
+                f"pinky_ext={pinky_ext_score_raw:.2f} active={int(gesture_features['pinky_up'])}",
+                f"index_curl={index_curl_score_raw:.2f}",
+                f"middle_curl={middle_curl_score_raw:.2f}",
+                f"ring_curl={ring_curl_score_raw:.2f}",
+                f"pinky_curl={pinky_curl_score_raw:.2f}",
+                f"pinch_dist={pinch_dist:.2f} thr={PINCH_THRESHOLD:.2f}",
+                f"fist_thr={FIST_THRESHOLD:.2f}",
+            ]
+            draw_debug_hud(frame, hud_lines)
 
             # --- Check for closed fist ---
-            if is_fist_closed(hand, gesture_features):
+            if fist_active:
                 set_state("fist", "Fist detected - mouse control paused")
+                if is_dragging:
+                    pyautogui.mouseUp(button="left")
+                    is_dragging = False
                 prev_px, prev_py = None, None
                 prev_hand_x, prev_hand_y = None, None
                 residual_move_x_px, residual_move_y_px = 0.0, 0.0
                 kalman_initialized = False
+                prev_index_up = False
+                prev_middle_up = False
                 last_positions.clear()
             else:
+                # Pinch-and-hold controls drag state regardless of movement mode.
+                if gesture_features["pinch_index_thumb"] and not is_dragging:
+                    pyautogui.mouseDown(button="left")
+                    is_dragging = True
+                    set_state("drag_start", "Pinch detected - drag start")
+                elif (not gesture_features["pinch_index_thumb"]) and is_dragging:
+                    pyautogui.mouseUp(button="left")
+                    is_dragging = False
+                    set_state("drag_end", "Pinch released - drag end")
+
+                index_up = gesture_features["index_up"]
+                middle_up = gesture_features["middle_up"]
+                left_tap_event = prev_index_up and (not index_up)
+                right_tap_event = prev_middle_up and (not middle_up)
+
+                # Index extension 1->0 transition = left click.
+                if (
+                    left_tap_event
+                    and middle_up
+                    and (frame_time - last_left_click_time) >= CLICK_COOLDOWN
+                    and not is_dragging
+                ):
+                    pyautogui.click(button="left")
+                    set_state("left_click", "Index tap detected - left click")
+                    last_left_click_time = frame_time
+
+                # Middle extension 1->0 transition = right click.
+                if (
+                    right_tap_event
+                    and index_up
+                    and (frame_time - last_right_click_time) >= CLICK_COOLDOWN
+                    and not is_dragging
+                ):
+                    pyautogui.click(button="right")
+                    set_state("right_click", "Middle tap detected - right click")
+                    last_right_click_time = frame_time
+
                 set_state("tracking", "Hand detected - controlling cursor")
                 # --- Weighted palm center ---
                 palm_points = [hand.landmark[i] for i in [0,5,9,13,17]]
@@ -314,30 +435,19 @@ while True:
                     residual_move_x_px, residual_move_y_px = 0.0, 0.0
                     kalman_initialized = False
 
-                # --- Example custom controls ---
-                # Pinch: left click
-                if gesture_features["pinch_index_thumb"] and (frame_time - last_click_time) >= CLICK_COOLDOWN:
-                    pyautogui.click()
-                    set_state("left_click", "Pinch detected - left click")
-                    last_click_time = frame_time
-
-                # Peace sign: right click
-                peace_sign = (
-                    gesture_features["index_up"]
-                    and gesture_features["middle_up"]
-                    and not gesture_features["ring_up"]
-                    and not gesture_features["pinky_up"]
-                )
-                if peace_sign and (frame_time - last_click_time) >= CLICK_COOLDOWN:
-                    pyautogui.rightClick()
-                    set_state("right_click", "Peace sign detected - right click")
-                    last_click_time = frame_time
+                prev_index_up = index_up
+                prev_middle_up = middle_up
         else:
             set_state("no_hand", "No hand detected")
+            if is_dragging:
+                pyautogui.mouseUp(button="left")
+                is_dragging = False
             prev_px, prev_py = None, None
             prev_hand_x, prev_hand_y = None, None
             residual_move_x_px, residual_move_y_px = 0.0, 0.0
             kalman_initialized = False
+            prev_index_up = False
+            prev_middle_up = False
             last_positions.clear()
 
         # --- Log mouse location every 0.5s only if position changed meaningfully ---

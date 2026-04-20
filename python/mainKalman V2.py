@@ -42,7 +42,7 @@ weights = [0.85, 0.03, 0.03, 0.03, 0.03]
 
 # --- Cursor control tuning ---
 # Use absolute mapped control instead of high-gain relative movement to avoid runaway corner jumps.
-mouse_smoothing = 0.6  # higher = quicker cursor response
+mouse_smoothing = 0.6  # higher = quicker cursor response, history, 0.6
 prev_mouse_x, prev_mouse_y = None, None
 
 # --- Function to detect closed fist ---

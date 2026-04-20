@@ -41,68 +41,24 @@ prev_px, prev_py = None, None
 weights = [0.85, 0.03, 0.03, 0.03, 0.03]
 
 # --- Cursor control tuning ---
-# Relative motion (mousepad-style): cursor moves by hand deltas, not absolute hand position.
-MOTION_SENSITIVITY_X = 2200.0
-MOTION_SENSITIVITY_Y = 2200.0
-MOTION_DEADZONE = 0.003
-MAX_STEP_PX = 70
-prev_hand_x, prev_hand_y = None, None
+# Use absolute mapped control instead of high-gain relative movement to avoid runaway corner jumps.
+mouse_smoothing = 0.6  # higher = quicker cursor response
+prev_mouse_x, prev_mouse_y = None, None
 
-# --- Gesture detection helpers ---
-# Tune these while watching the debug overlay.
-FINGER_UP_MARGIN = 0.015
-PINCH_THRESHOLD = 0.45
-FIST_THRESHOLD = 0.62
+# --- Function to detect closed fist ---
+def is_fist_closed(hand_landmarks):
+    # Check if all fingertips are close to their respective base joints
+    fingertips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
+    bases = [6, 10, 14, 18]       # Corresponding base joints
 
-
-def landmark_xy(hand_landmarks, idx):
-    lm = hand_landmarks.landmark[idx]
-    return np.array([lm.x, lm.y], dtype=np.float32)
-
-
-def distance(hand_landmarks, idx_a, idx_b):
-    return float(np.linalg.norm(landmark_xy(hand_landmarks, idx_a) - landmark_xy(hand_landmarks, idx_b)))
-
-
-def palm_scale(hand_landmarks):
-    # Normalize distances by palm size so thresholds work at different camera distances.
-    return max(distance(hand_landmarks, 0, 9), 1e-6)
-
-
-def normalized_distance(hand_landmarks, idx_a, idx_b):
-    return distance(hand_landmarks, idx_a, idx_b) / palm_scale(hand_landmarks)
-
-
-def finger_is_extended(hand_landmarks, tip_idx, pip_idx, margin=FINGER_UP_MARGIN):
-    # In image coordinates, smaller y means higher on the screen.
-    tip_y = hand_landmarks.landmark[tip_idx].y
-    pip_y = hand_landmarks.landmark[pip_idx].y
-    return tip_y < (pip_y - margin)
-
-
-def get_gesture_features(hand_landmarks):
-    features = {
-        "index_up": finger_is_extended(hand_landmarks, 8, 6),
-        "middle_up": finger_is_extended(hand_landmarks, 12, 10),
-        "ring_up": finger_is_extended(hand_landmarks, 16, 14),
-        "pinky_up": finger_is_extended(hand_landmarks, 20, 18),
-        "pinch_index_thumb": normalized_distance(hand_landmarks, 4, 8) < PINCH_THRESHOLD,
-    }
-
-    fold_scores = [
-        normalized_distance(hand_landmarks, 8, 5),
-        normalized_distance(hand_landmarks, 12, 9),
-        normalized_distance(hand_landmarks, 16, 13),
-        normalized_distance(hand_landmarks, 20, 17),
-    ]
-    features["fist_score"] = float(np.mean(fold_scores))
-    return features
-
-
-def is_fist_closed(hand_landmarks, features=None, threshold=FIST_THRESHOLD):
-    if features is None:
-        features = get_gesture_features(hand_landmarks)
-    return features["fist_score"] < threshold
+    for tip, base in zip(fingertips, bases):
+        tip_pos = hand_landmarks.landmark[tip]
+        base_pos = hand_landmarks.landmark[base]
+        # Calculate Euclidean distance between tip and base
+        distance = np.sqrt((tip_pos.x - base_pos.x)**2 + (tip_pos.y - base_pos.y)**2)
+        if distance > 0.05:  # Threshold for "closed" (adjust as needed)
+            return False
+    return True
 
 # --- Setup logging ---
 logging.basicConfig(
@@ -135,14 +91,9 @@ last_log_time = time.time()
 # --- Optimize mouse location logging to reduce log size ---
 last_logged_mouse_position = None  # Track the last logged mouse position
 
-# --- Gesture action cooldowns ---
-last_click_time = 0.0
-CLICK_COOLDOWN = 0.35
-
 while True:
     try:
         ret, frame = cap.read()
-        frame_time = time.time()
         if not ret:
             set_state("no_frame", "Failed to read frame from webcam")
             break
@@ -163,24 +114,12 @@ while True:
         if result.multi_hand_landmarks:
             hand = result.multi_hand_landmarks[0]
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-            gesture_features = get_gesture_features(hand)
-
-            # Debug view for learning and tuning custom gestures.
-            debug_text = (
-                f"I:{int(gesture_features['index_up'])} "
-                f"M:{int(gesture_features['middle_up'])} "
-                f"R:{int(gesture_features['ring_up'])} "
-                f"P:{int(gesture_features['pinky_up'])} "
-                f"Pinch:{int(gesture_features['pinch_index_thumb'])} "
-                f"FistScore:{gesture_features['fist_score']:.2f}"
-            )
-            cv2.putText(frame, debug_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             # --- Check for closed fist ---
-            if is_fist_closed(hand, gesture_features):
+            if is_fist_closed(hand):
                 set_state("fist", "Fist detected - mouse control paused")
                 prev_px, prev_py = None, None
-                prev_hand_x, prev_hand_y = None, None
+                prev_mouse_x, prev_mouse_y = None, None
                 last_positions.clear()
             else:
                 set_state("tracking", "Hand detected - controlling cursor")
@@ -207,61 +146,42 @@ while True:
                 avg_x = sum(p[0] for p in last_positions) / len(last_positions)
                 avg_y = sum(p[1] for p in last_positions) / len(last_positions)
 
-                # --- Convert smoothed hand location to frame pixels (for active-zone check only) ---
+                # --- Convert to pixels ---
                 palm_px = int(avg_x * frame_w)
                 palm_py = int(avg_y * frame_h)
 
-                # --- Relative cursor movement only if inside detection box ---
+                # --- Map to screen only if inside detection box ---
                 if x_min <= palm_px <= x_max and y_min <= palm_py <= y_max:
-                    if prev_hand_x is None or prev_hand_y is None:
-                        # Re-anchor without moving cursor (like lifting and placing a mouse).
-                        prev_hand_x, prev_hand_y = avg_x, avg_y
+                    norm_x = (palm_px - x_min) / max(1, (x_max - x_min))
+                    norm_y = (palm_py - y_min) / max(1, (y_max - y_min))
+
+                    target_x = int(norm_x * (screen_width - 1))
+                    target_y = int(norm_y * (screen_height - 1))
+
+                    target_x = int(np.clip(target_x, SAFE_EDGE_PADDING, screen_width - 1 - SAFE_EDGE_PADDING))
+                    target_y = int(np.clip(target_y, SAFE_EDGE_PADDING, screen_height - 1 - SAFE_EDGE_PADDING))
+
+                    if prev_mouse_x is None or prev_mouse_y is None:
+                        move_x, move_y = target_x, target_y
                     else:
-                        dx = avg_x - prev_hand_x
-                        dy = avg_y - prev_hand_y
+                        move_x = int(mouse_smoothing * target_x + (1 - mouse_smoothing) * prev_mouse_x)
+                        move_y = int(mouse_smoothing * target_y + (1 - mouse_smoothing) * prev_mouse_y)
 
-                        if abs(dx) >= MOTION_DEADZONE or abs(dy) >= MOTION_DEADZONE:
-                            move_dx = int(np.clip(dx * MOTION_SENSITIVITY_X, -MAX_STEP_PX, MAX_STEP_PX))
-                            move_dy = int(np.clip(dy * MOTION_SENSITIVITY_Y, -MAX_STEP_PX, MAX_STEP_PX))
-                            if move_dx != 0 or move_dy != 0:
-                                cur_x, cur_y = pyautogui.position()
-                                new_x = int(np.clip(cur_x + move_dx, SAFE_EDGE_PADDING, screen_width - 1 - SAFE_EDGE_PADDING))
-                                new_y = int(np.clip(cur_y + move_dy, SAFE_EDGE_PADDING, screen_height - 1 - SAFE_EDGE_PADDING))
-                                pyautogui.moveTo(new_x, new_y)
-
-                        prev_hand_x, prev_hand_y = avg_x, avg_y
-
+                    pyautogui.moveTo(move_x, move_y)
+                    prev_mouse_x, prev_mouse_y = move_x, move_y
                     prev_px, prev_py = avg_x, avg_y
                 else:
                     prev_px, prev_py = None, None
-                    prev_hand_x, prev_hand_y = None, None
-
-                # --- Example custom controls ---
-                # Pinch: left click
-                if gesture_features["pinch_index_thumb"] and (frame_time - last_click_time) >= CLICK_COOLDOWN:
-                    pyautogui.click()
-                    set_state("left_click", "Pinch detected - left click")
-                    last_click_time = frame_time
-
-                # Peace sign: right click
-                peace_sign = (
-                    gesture_features["index_up"]
-                    and gesture_features["middle_up"]
-                    and not gesture_features["ring_up"]
-                    and not gesture_features["pinky_up"]
-                )
-                if peace_sign and (frame_time - last_click_time) >= CLICK_COOLDOWN:
-                    pyautogui.rightClick()
-                    set_state("right_click", "Peace sign detected - right click")
-                    last_click_time = frame_time
+                    prev_mouse_x, prev_mouse_y = None, None
         else:
             set_state("no_hand", "No hand detected")
             prev_px, prev_py = None, None
-            prev_hand_x, prev_hand_y = None, None
+            prev_mouse_x, prev_mouse_y = None, None
             last_positions.clear()
 
         # --- Log mouse location every 0.5s only if position changed meaningfully ---
-        if frame_time - last_log_time >= 0.5:
+        current_time = time.time()
+        if current_time - last_log_time >= 0.5:
             mouse_x, mouse_y = pyautogui.position()
             if (
                 last_logged_mouse_position is None
@@ -270,7 +190,7 @@ while True:
             ):
                 logging.info(f"Mouse location: x={mouse_x}, y={mouse_y}")
                 last_logged_mouse_position = (mouse_x, mouse_y)
-            last_log_time = frame_time
+            last_log_time = current_time
 
         # --- Display ---
         cv2.imshow("Air Mouse", frame)

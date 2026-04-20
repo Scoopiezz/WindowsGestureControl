@@ -12,9 +12,23 @@ mp_draw = mp.solutions.drawing_utils
 hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 
 # --- Webcam ---
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+CAMERA_INDEX = 0
+TARGET_CAMERA_WIDTH = 1280
+TARGET_CAMERA_HEIGHT = 720
+TARGET_CAMERA_FPS = 60
+
+# Try DirectShow first on Windows for better control of FPS/codec.
+cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+
+# Request a compressed stream format and timing before capture starts.
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_CAMERA_HEIGHT)
+cap.set(cv2.CAP_PROP_FPS, TARGET_CAMERA_FPS)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
 cv2.namedWindow("Air Mouse", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Air Mouse", 1280, 720)
 
@@ -30,10 +44,13 @@ kalman = cv2.KalmanFilter(4, 2)
 kalman.measurementMatrix = np.array([[1,0,0,0],[0,1,0,0]], np.float32)
 kalman.transitionMatrix = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], np.float32)
 kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.02
+kalman.errorCovPost = np.eye(4, dtype=np.float32)
+kalman_initialized = False
 
 # --- Smoothing / moving average setup ---
-alpha = 0.75  # higher = more responsive low-pass output
-ma_len = 3  # shorter window = lower latency
+alpha = 0.9  # higher = more responsive low-pass output
+ma_len = 2  # shorter window = lower latency
 last_positions = deque(maxlen=ma_len)
 prev_px, prev_py = None, None
 
@@ -44,9 +61,13 @@ weights = [0.85, 0.03, 0.03, 0.03, 0.03]
 # Relative motion (mousepad-style): cursor moves by hand deltas, not absolute hand position.
 MOTION_SENSITIVITY_X = 2200.0
 MOTION_SENSITIVITY_Y = 2200.0
-MOTION_DEADZONE = 0.003
+MOTION_DEADZONE = 0.0
 MAX_STEP_PX = 70
+MOTION_ACCEL_GAIN = 8.0
+MOTION_ACCEL_MAX = 2.4
+AXIS_DOMINANCE_RATIO = 2.2
 prev_hand_x, prev_hand_y = None, None
+residual_move_x_px, residual_move_y_px = 0.0, 0.0
 
 # --- Gesture detection helpers ---
 # Tune these while watching the debug overlay.
@@ -104,6 +125,14 @@ def is_fist_closed(hand_landmarks, features=None, threshold=FIST_THRESHOLD):
         features = get_gesture_features(hand_landmarks)
     return features["fist_score"] < threshold
 
+
+def reset_kalman_to(x, y):
+    state = np.array([[np.float32(x)], [np.float32(y)], [0.0], [0.0]], dtype=np.float32)
+    kalman.statePre = state.copy()
+    kalman.statePost = state.copy()
+    kalman.errorCovPre = np.eye(4, dtype=np.float32)
+    kalman.errorCovPost = np.eye(4, dtype=np.float32)
+
 # --- Setup logging ---
 logging.basicConfig(
     filename="air_mouse.log",
@@ -111,6 +140,19 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logging.info("Program started")
+
+actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+actual_fps = cap.get(cv2.CAP_PROP_FPS)
+actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+actual_fourcc_str = "".join(chr((actual_fourcc >> (8 * i)) & 0xFF) for i in range(4))
+
+camera_info = (
+    f"Camera requested {TARGET_CAMERA_WIDTH}x{TARGET_CAMERA_HEIGHT}@{TARGET_CAMERA_FPS} FPS, "
+    f"actual {actual_w}x{actual_h}@{actual_fps:.2f} FPS, codec={actual_fourcc_str}"
+)
+print(camera_info)
+logging.info(camera_info)
 
 # --- Add debug logs to identify loading issue ---
 logging.info("Attempting to access webcam...")
@@ -181,6 +223,8 @@ while True:
                 set_state("fist", "Fist detected - mouse control paused")
                 prev_px, prev_py = None, None
                 prev_hand_x, prev_hand_y = None, None
+                residual_move_x_px, residual_move_y_px = 0.0, 0.0
+                kalman_initialized = False
                 last_positions.clear()
             else:
                 set_state("tracking", "Hand detected - controlling cursor")
@@ -189,18 +233,23 @@ while True:
                 palm_x = sum(p.x * w for p, w in zip(palm_points, weights))
                 palm_y = sum(p.y * w for p, w in zip(palm_points, weights))
 
-                # --- Kalman prediction ---
-                measurement = np.array([[np.float32(palm_x)], [np.float32(palm_y)]]);
-                kalman.correct(measurement)
-                prediction = kalman.predict()
-                palm_x_pred, palm_y_pred = prediction[0][0], prediction[1][0]
+                # --- Kalman filtering ---
+                if not kalman_initialized:
+                    reset_kalman_to(palm_x, palm_y)
+                    kalman_initialized = True
+                    palm_x_filt, palm_y_filt = palm_x, palm_y
+                else:
+                    measurement = np.array([[np.float32(palm_x)], [np.float32(palm_y)]], dtype=np.float32)
+                    kalman.predict()
+                    corrected = kalman.correct(measurement)
+                    palm_x_filt, palm_y_filt = float(corrected[0][0]), float(corrected[1][0])
 
                 # --- Exponential smoothing ---
                 if prev_px is None or prev_py is None:
-                    smooth_x, smooth_y = palm_x_pred, palm_y_pred
+                    smooth_x, smooth_y = palm_x_filt, palm_y_filt
                 else:
-                    smooth_x = alpha * palm_x_pred + (1 - alpha) * prev_px
-                    smooth_y = alpha * palm_y_pred + (1 - alpha) * prev_py
+                    smooth_x = alpha * palm_x_filt + (1 - alpha) * prev_px
+                    smooth_y = alpha * palm_y_filt + (1 - alpha) * prev_py
 
                 # --- Add to moving average buffer ---
                 last_positions.append((smooth_x, smooth_y))
@@ -221,8 +270,34 @@ while True:
                         dy = avg_y - prev_hand_y
 
                         if abs(dx) >= MOTION_DEADZONE or abs(dy) >= MOTION_DEADZONE:
-                            move_dx = int(np.clip(dx * MOTION_SENSITIVITY_X, -MAX_STEP_PX, MAX_STEP_PX))
-                            move_dy = int(np.clip(dy * MOTION_SENSITIVITY_Y, -MAX_STEP_PX, MAX_STEP_PX))
+                            # Reduce diagonal drift from hand roll when one axis clearly dominates.
+                            if abs(dx) > abs(dy) * AXIS_DOMINANCE_RATIO:
+                                dy = 0.0
+                            elif abs(dy) > abs(dx) * AXIS_DOMINANCE_RATIO:
+                                dx = 0.0
+
+                            speed = float(np.hypot(dx, dy))
+                            speed_gain = min(1.0 + (speed * MOTION_ACCEL_GAIN), MOTION_ACCEL_MAX)
+                            dynamic_max_step = max(1, int(MAX_STEP_PX * speed_gain))
+
+                            desired_move_x = (dx * MOTION_SENSITIVITY_X * speed_gain) + residual_move_x_px
+                            desired_move_y = (dy * MOTION_SENSITIVITY_Y * speed_gain) + residual_move_y_px
+
+                            uncapped_move_dx = int(np.trunc(desired_move_x))
+                            uncapped_move_dy = int(np.trunc(desired_move_y))
+                            move_dx = int(np.clip(uncapped_move_dx, -dynamic_max_step, dynamic_max_step))
+                            move_dy = int(np.clip(uncapped_move_dy, -dynamic_max_step, dynamic_max_step))
+
+                            if move_dx != uncapped_move_dx:
+                                residual_move_x_px = 0.0
+                            else:
+                                residual_move_x_px = float(np.clip(desired_move_x - move_dx, -1.0, 1.0))
+
+                            if move_dy != uncapped_move_dy:
+                                residual_move_y_px = 0.0
+                            else:
+                                residual_move_y_px = float(np.clip(desired_move_y - move_dy, -1.0, 1.0))
+
                             if move_dx != 0 or move_dy != 0:
                                 cur_x, cur_y = pyautogui.position()
                                 new_x = int(np.clip(cur_x + move_dx, SAFE_EDGE_PADDING, screen_width - 1 - SAFE_EDGE_PADDING))
@@ -235,6 +310,8 @@ while True:
                 else:
                     prev_px, prev_py = None, None
                     prev_hand_x, prev_hand_y = None, None
+                    residual_move_x_px, residual_move_y_px = 0.0, 0.0
+                    kalman_initialized = False
 
                 # --- Example custom controls ---
                 # Pinch: left click
@@ -258,6 +335,8 @@ while True:
             set_state("no_hand", "No hand detected")
             prev_px, prev_py = None, None
             prev_hand_x, prev_hand_y = None, None
+            residual_move_x_px, residual_move_y_px = 0.0, 0.0
+            kalman_initialized = False
             last_positions.clear()
 
         # --- Log mouse location every 0.5s only if position changed meaningfully ---

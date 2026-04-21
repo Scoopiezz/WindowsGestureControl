@@ -74,6 +74,7 @@ residual_move_x_px, residual_move_y_px = 0.0, 0.0
 FINGER_UP_MARGIN = 0.015 # Minimum distance in y between fingertip and pip joint to be considered "up". Adjust for camera distance. 
 PINCH_THRESHOLD = 0.45 # Maximum normalized distance between index fingertip and thumb tip to be considered a pinch. Adjust for camera distance.
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
+ENABLE_LOGGING = False
 
 
 
@@ -135,11 +136,14 @@ def reset_kalman_to(x, y):
     kalman.errorCovPost = np.eye(4, dtype=np.float32)
 
 # --- Setup logging ---
-logging.basicConfig(
-    filename="air_mouse.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+if ENABLE_LOGGING:
+    logging.basicConfig(
+        filename="air_mouse.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+else:
+    logging.disable(logging.CRITICAL)
 logging.info("Program started")
 
 actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

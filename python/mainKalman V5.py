@@ -74,6 +74,9 @@ residual_move_x_px, residual_move_y_px = 0.0, 0.0
 FINGER_UP_MARGIN = 0.015 # Minimum distance in y between fingertip and pip joint to be considered "up". Adjust for camera distance. 
 PINCH_THRESHOLD = 0.25 # Maximum normalized distance between index fingertip and thumb tip to be considered a pinch. Adjust for camera distance. history: 0.45 -> 0.25,
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
+DETECTION_BOX_MARGIN_RATIO = 0.08  # Smaller margin means a larger active box.
+ENABLE_LOGGING = False
+SHOW_DEBUG_HUD = False
 
 
 
@@ -154,11 +157,14 @@ def draw_debug_hud(frame, lines):
         y += 22
 
 # --- Setup logging ---
-logging.basicConfig(
-    filename="air_mouse.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+if ENABLE_LOGGING:
+    logging.basicConfig(
+        filename="air_mouse.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+else:
+    logging.disable(logging.CRITICAL)
 logging.info("Program started")
 
 actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -191,12 +197,6 @@ def set_state(new_state, message):
 print("Starting Air Mouse program... Check 'air_mouse.log' for detailed logs.")
 logging.info("Starting Air Mouse program...")
 
-# --- Add periodic mouse location logging ---
-last_log_time = time.time()
-
-# --- Optimize mouse location logging to reduce log size ---
-last_logged_mouse_position = None  # Track the last logged mouse position
-
 # --- Gesture action cooldowns ---
 CLICK_COOLDOWN = 0.5
 last_left_click_time = 0.0
@@ -219,9 +219,9 @@ while True:
 
         frame_h, frame_w, _ = frame.shape
 
-        # --- Detection box (15% margin) ---
-        margin_x = int(frame_w * 0.15)
-        margin_y = int(frame_h * 0.15)
+        # --- Detection box (configurable margin ratio) ---
+        margin_x = int(frame_w * DETECTION_BOX_MARGIN_RATIO)
+        margin_y = int(frame_h * DETECTION_BOX_MARGIN_RATIO)
         x_min, x_max = margin_x, frame_w - margin_x
         y_min, y_max = margin_y, frame_h - margin_y
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
@@ -230,73 +230,74 @@ while True:
             hand = result.multi_hand_landmarks[0]
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
             gesture_features = get_gesture_features(hand)
-
-            margin = max(FINGER_UP_MARGIN, 1e-6)
-
-            index_ext_score_raw = (hand.landmark[6].y - hand.landmark[8].y) / margin
-            middle_ext_score_raw = (hand.landmark[10].y - hand.landmark[12].y) / margin
-            ring_ext_score_raw = (hand.landmark[14].y - hand.landmark[16].y) / margin
-            pinky_ext_score_raw = (hand.landmark[18].y - hand.landmark[20].y) / margin
-
-            index_curl_score_raw = (hand.landmark[8].y - hand.landmark[6].y) / margin
-            middle_curl_score_raw = (hand.landmark[12].y - hand.landmark[10].y) / margin
-            ring_curl_score_raw = (hand.landmark[16].y - hand.landmark[14].y) / margin
-            pinky_curl_score_raw = (hand.landmark[20].y - hand.landmark[18].y) / margin
-
-            index_ext_score = clamp01(index_ext_score_raw)
-            middle_ext_score = clamp01(middle_ext_score_raw)
-            ring_curl_score = clamp01(ring_curl_score_raw)
-            pinky_curl_score = clamp01(pinky_curl_score_raw)
-            index_curl_score = clamp01(index_curl_score_raw)
-            middle_curl_score = clamp01(middle_curl_score_raw)
-
-            pinch_dist = normalized_distance(hand, 4, 8)
-
-            movement_pose = (
-                gesture_features["index_up"]
-                and gesture_features["middle_up"]
-                and not gesture_features["ring_up"]
-                and not gesture_features["pinky_up"]
-            )
-            left_tap_pose = (
-                not gesture_features["index_up"]
-                and gesture_features["middle_up"]
-                and not gesture_features["ring_up"]
-                and not gesture_features["pinky_up"]
-            )
-            right_tap_pose = (
-                gesture_features["index_up"]
-                and not gesture_features["middle_up"]
-                and not gesture_features["ring_up"]
-                and not gesture_features["pinky_up"]
-            )
-
-            movement_score = (index_ext_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-            left_tap_score = (index_curl_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-            right_tap_score = (middle_curl_score + index_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-
-            pinch_score = clamp01((PINCH_THRESHOLD - pinch_dist) / max(PINCH_THRESHOLD, 1e-6))
             fist_active = is_fist_closed(hand, gesture_features)
 
-            hud_lines = [
-                f"move score={movement_score:.2f} active={int(movement_pose)}",
-                f"left_tap score={left_tap_score:.2f} active={int(left_tap_pose)}",
-                f"right_tap score={right_tap_score:.2f} active={int(right_tap_pose)}",
-                f"pinch score={pinch_score:.2f} active={int(gesture_features['pinch_index_thumb'])}",
-                f"fist score={gesture_features['fist_score']:.2f} active={int(fist_active)}",
-                f"drag active={int(is_dragging)}",
-                f"index_ext={index_ext_score_raw:.2f} active={int(gesture_features['index_up'])}",
-                f"middle_ext={middle_ext_score_raw:.2f} active={int(gesture_features['middle_up'])}",
-                f"ring_ext={ring_ext_score_raw:.2f} active={int(gesture_features['ring_up'])}",
-                f"pinky_ext={pinky_ext_score_raw:.2f} active={int(gesture_features['pinky_up'])}",
-                f"index_curl={index_curl_score_raw:.2f}",
-                f"middle_curl={middle_curl_score_raw:.2f}",
-                f"ring_curl={ring_curl_score_raw:.2f}",
-                f"pinky_curl={pinky_curl_score_raw:.2f}",
-                f"pinch_dist={pinch_dist:.2f} thr={PINCH_THRESHOLD:.2f}",
-                f"fist_thr={FIST_THRESHOLD:.2f}",
-            ]
-            draw_debug_hud(frame, hud_lines)
+            if SHOW_DEBUG_HUD:
+                margin = max(FINGER_UP_MARGIN, 1e-6)
+
+                index_ext_score_raw = (hand.landmark[6].y - hand.landmark[8].y) / margin
+                middle_ext_score_raw = (hand.landmark[10].y - hand.landmark[12].y) / margin
+                ring_ext_score_raw = (hand.landmark[14].y - hand.landmark[16].y) / margin
+                pinky_ext_score_raw = (hand.landmark[18].y - hand.landmark[20].y) / margin
+
+                index_curl_score_raw = (hand.landmark[8].y - hand.landmark[6].y) / margin
+                middle_curl_score_raw = (hand.landmark[12].y - hand.landmark[10].y) / margin
+                ring_curl_score_raw = (hand.landmark[16].y - hand.landmark[14].y) / margin
+                pinky_curl_score_raw = (hand.landmark[20].y - hand.landmark[18].y) / margin
+
+                index_ext_score = clamp01(index_ext_score_raw)
+                middle_ext_score = clamp01(middle_ext_score_raw)
+                ring_curl_score = clamp01(ring_curl_score_raw)
+                pinky_curl_score = clamp01(pinky_curl_score_raw)
+                index_curl_score = clamp01(index_curl_score_raw)
+                middle_curl_score = clamp01(middle_curl_score_raw)
+
+                pinch_dist = normalized_distance(hand, 4, 8)
+
+                movement_pose = (
+                    gesture_features["index_up"]
+                    and gesture_features["middle_up"]
+                    and not gesture_features["ring_up"]
+                    and not gesture_features["pinky_up"]
+                )
+                left_tap_pose = (
+                    not gesture_features["index_up"]
+                    and gesture_features["middle_up"]
+                    and not gesture_features["ring_up"]
+                    and not gesture_features["pinky_up"]
+                )
+                right_tap_pose = (
+                    gesture_features["index_up"]
+                    and not gesture_features["middle_up"]
+                    and not gesture_features["ring_up"]
+                    and not gesture_features["pinky_up"]
+                )
+
+                movement_score = (index_ext_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+                left_tap_score = (index_curl_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+                right_tap_score = (middle_curl_score + index_ext_score + ring_curl_score + pinky_curl_score) / 4.0
+
+                pinch_score = clamp01((PINCH_THRESHOLD - pinch_dist) / max(PINCH_THRESHOLD, 1e-6))
+
+                hud_lines = [
+                    f"move score={movement_score:.2f} active={int(movement_pose)}",
+                    f"left_tap score={left_tap_score:.2f} active={int(left_tap_pose)}",
+                    f"right_tap score={right_tap_score:.2f} active={int(right_tap_pose)}",
+                    f"pinch score={pinch_score:.2f} active={int(gesture_features['pinch_index_thumb'])}",
+                    f"fist score={gesture_features['fist_score']:.2f} active={int(fist_active)}",
+                    f"drag active={int(is_dragging)}",
+                    f"index_ext={index_ext_score_raw:.2f} active={int(gesture_features['index_up'])}",
+                    f"middle_ext={middle_ext_score_raw:.2f} active={int(gesture_features['middle_up'])}",
+                    f"ring_ext={ring_ext_score_raw:.2f} active={int(gesture_features['ring_up'])}",
+                    f"pinky_ext={pinky_ext_score_raw:.2f} active={int(gesture_features['pinky_up'])}",
+                    f"index_curl={index_curl_score_raw:.2f}",
+                    f"middle_curl={middle_curl_score_raw:.2f}",
+                    f"ring_curl={ring_curl_score_raw:.2f}",
+                    f"pinky_curl={pinky_curl_score_raw:.2f}",
+                    f"pinch_dist={pinch_dist:.2f} thr={PINCH_THRESHOLD:.2f}",
+                    f"fist_thr={FIST_THRESHOLD:.2f}",
+                ]
+                draw_debug_hud(frame, hud_lines)
 
             # --- Check for closed fist ---
             if fist_active:
@@ -438,7 +439,6 @@ while True:
                 prev_index_up = index_up
                 prev_middle_up = middle_up
         else:
-            set_state("no_hand", "No hand detected")
             if is_dragging:
                 pyautogui.mouseUp(button="left")
                 is_dragging = False
@@ -449,18 +449,6 @@ while True:
             prev_index_up = False
             prev_middle_up = False
             last_positions.clear()
-
-        # --- Log mouse location every 0.5s only if position changed meaningfully ---
-        if frame_time - last_log_time >= 0.5:
-            mouse_x, mouse_y = pyautogui.position()
-            if (
-                last_logged_mouse_position is None
-                or abs(mouse_x - last_logged_mouse_position[0]) >= 25
-                or abs(mouse_y - last_logged_mouse_position[1]) >= 25
-            ):
-                logging.info(f"Mouse location: x={mouse_x}, y={mouse_y}")
-                last_logged_mouse_position = (mouse_x, mouse_y)
-            last_log_time = frame_time
 
         # --- Display ---
         cv2.imshow("Air Mouse", frame)

@@ -77,6 +77,7 @@ PINCH_OUT_THRESHOLD = 0.30 # Exit pinch/drag when thumb-index distance rises abo
 PINCH_IN_FRAMES = 3 # Consecutive frames required to start drag.
 PINCH_OUT_FRAMES = 2 # Consecutive frames required to end drag.
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
+FIST_PRECLICK_MARGIN = 0.10 # Block tap clicks while fist score is near the closed-fist threshold.
 DETECTION_BOX_MARGIN_RATIO = 0.08  # Smaller margin means a larger active box.
 ENABLE_LOGGING = False
 SHOW_DEBUG_HUD = True
@@ -220,7 +221,7 @@ logging.info("Starting Air Mouse program...")
 
 # --- Gesture action cooldowns ---
 CLICK_COOLDOWN = 0.3
-FIST_CLICK_SUPPRESSION_SECONDS = 0.2
+FIST_CLICK_SUPPRESSION_SECONDS = 0.35
 last_left_click_time = 0.0
 last_right_click_time = 0.0
 # SCROLL_INTERVAL = 0.05
@@ -259,6 +260,7 @@ while True:
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
             gesture_features = get_gesture_features(hand)
             fist_active = is_fist_closed(hand, gesture_features)
+            fist_candidate_active = gesture_features["fist_score"] < (FIST_THRESHOLD + FIST_PRECLICK_MARGIN)
             # thumb_dir = thumb_vertical_direction(hand)
             # non_thumb_fingers_folded = (
             #     (not gesture_features["index_up"])
@@ -335,7 +337,7 @@ while True:
                     f"pinky_curl={pinky_curl_score_raw:.2f}",
                     f"pinch_dist={pinch_dist:.2f} in={PINCH_IN_THRESHOLD:.2f} out={PINCH_OUT_THRESHOLD:.2f}",
                     f"pinch_frames in={pinch_in_count}/{PINCH_IN_FRAMES} out={pinch_out_count}/{PINCH_OUT_FRAMES}",
-                    f"fist_thr={FIST_THRESHOLD:.2f}",
+                    f"fist_thr={FIST_THRESHOLD:.2f} guard<{(FIST_THRESHOLD + FIST_PRECLICK_MARGIN):.2f}",
                 ]
                 draw_debug_hud(frame, hud_lines)
 
@@ -402,6 +404,7 @@ while True:
                     and (frame_time - last_left_click_time) >= CLICK_COOLDOWN
                     and not is_dragging
                     and not pinch_candidate_active
+                    and not fist_candidate_active
                     and click_input_allowed
                 ):
                     pyautogui.click(button="left")
@@ -415,6 +418,7 @@ while True:
                     and (frame_time - last_right_click_time) >= CLICK_COOLDOWN
                     and not is_dragging
                     and not pinch_candidate_active
+                    and not fist_candidate_active
                     and click_input_allowed
                 ):
                     pyautogui.click(button="right")

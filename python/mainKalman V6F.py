@@ -9,7 +9,7 @@ import time
 # --- MediaPipe Hands ---
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7)
 
 # --- Webcam ---
 CAMERA_INDEX = 0
@@ -78,6 +78,8 @@ PINCH_IN_FRAMES = 3 # Consecutive frames required to start drag.
 PINCH_OUT_FRAMES = 2 # Consecutive frames required to end drag.
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
 DETECTION_BOX_MARGIN_RATIO = 0.08  # Smaller margin means a larger active box.
+HAND_REACQUIRE_DISTANCE = 0.12 # Max normalized distance to keep tracking same hand. If detected hand is farther, consider it a different person.
+HAND_LOST_FRAMES_BEFORE_RESET = 10 # After this many missed frames, clear hand lock and allow new hand to be acquired.
 ENABLE_LOGGING = False
 SHOW_DEBUG_HUD = True
 # THUMB_VERTICAL_MARGIN = 0.035
@@ -108,6 +110,23 @@ def finger_is_extended(hand_landmarks, tip_idx, pip_idx, margin=FINGER_UP_MARGIN
     tip_y = hand_landmarks.landmark[tip_idx].y
     pip_y = hand_landmarks.landmark[pip_idx].y
     return tip_y < (pip_y - margin)
+
+
+def get_palm_center(hand_landmarks):
+    # Calculate weighted palm center using same weights as cursor control.
+    # Returns (x, y) normalized to 0-1 frame coordinates.
+    palm_points = [hand_landmarks.landmark[i] for i in [0, 5, 9, 13, 17]]
+    palm_x = sum(p.x * w for p, w in zip(palm_points, weights))
+    palm_y = sum(p.y * w for p, w in zip(palm_points, weights))
+    return (palm_x, palm_y)
+
+
+def hand_distance(center_a, center_b):
+    # Euclidean distance between two palm centers in normalized coordinates.
+    # Used to decide if a detected hand is the same hand we were tracking.
+    dx = center_a[0] - center_b[0]
+    dy = center_a[1] - center_b[1]
+    return float(np.hypot(dx, dy))
 
 
 # def thumb_vertical_direction(hand_landmarks, min_vertical=THUMB_VERTICAL_MARGIN, vertical_ratio=THUMB_VERTICAL_RATIO):
@@ -232,6 +251,8 @@ pinch_in_count = 0
 pinch_out_count = 0
 prev_index_up = False
 prev_middle_up = False
+tracked_hand_center = None
+lost_hand_frames = 0
 
 while True:
     try:
@@ -254,8 +275,46 @@ while True:
         y_min, y_max = margin_y, frame_h - margin_y
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
 
+        # --- Hand locking: choose best candidate based on tracked position ---
+        hand = None
         if result.multi_hand_landmarks:
-            hand = result.multi_hand_landmarks[0]
+            # Calculate palm centers for all detected hands.
+            hand_candidates = []
+            for detected_hand in result.multi_hand_landmarks:
+                center = get_palm_center(detected_hand)
+                hand_candidates.append((center, detected_hand))
+
+            if tracked_hand_center is None:
+                # No hand tracked yet. Lock onto the first detected hand.
+                tracked_hand_center = hand_candidates[0][0]
+                hand = hand_candidates[0][1]
+                lost_hand_frames = 0
+                set_state("hand_acquired", "Hand locked - beginning tracking")
+            else:
+                # A hand is already locked. Find the closest detected hand to our tracked position.
+                best_candidate = None
+                best_distance = float('inf')
+
+                for center, candidate_hand in hand_candidates:
+                    dist = hand_distance(tracked_hand_center, center)
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_candidate = (center, candidate_hand)
+
+                # Check if the closest hand is within reacquire distance (probably our hand).
+                if best_distance <= HAND_REACQUIRE_DISTANCE:
+                    # The closest hand is close enough to be our tracked hand.
+                    hand = best_candidate[1]
+                    tracked_hand_center = best_candidate[0]
+                    lost_hand_frames = 0
+                    set_state("hand_tracked", f"Hand tracked - distance={best_distance:.3f}")
+                else:
+                    # Closest hand is too far. Our hand may have left or been obscured.
+                    # Do not switch to another hand yet.
+                    lost_hand_frames += 1
+                    set_state("hand_lost_candidate", f"Lost hand - no close candidate, frames={lost_hand_frames}")
+
+        if hand is not None:
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
             gesture_features = get_gesture_features(hand)
             fist_active = is_fist_closed(hand, gesture_features)
@@ -523,7 +582,21 @@ while True:
 
                 prev_index_up = index_up
                 prev_middle_up = middle_up
+            
+            # After lost too long, reset hand lock to allow reacquire.
+            if lost_hand_frames >= HAND_LOST_FRAMES_BEFORE_RESET:
+                tracked_hand_center = None
+                lost_hand_frames = 0
+                set_state("hand_reset", "Hand lock reset - ready for new hand")
         else:
+            # No hand currently being tracked (either never found or lost too long).
+            if tracked_hand_center is not None:
+                lost_hand_frames += 1
+                if lost_hand_frames >= HAND_LOST_FRAMES_BEFORE_RESET:
+                    tracked_hand_center = None
+                    lost_hand_frames = 0
+                    set_state("hand_reset", "Hand lock reset - ready for new hand")
+
             if is_dragging:
                 pyautogui.mouseUp(button="left")
                 is_dragging = False

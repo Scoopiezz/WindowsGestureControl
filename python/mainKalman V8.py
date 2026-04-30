@@ -77,11 +77,36 @@ PINCH_OUT_THRESHOLD = 0.30 # Exit pinch/drag when thumb-index distance rises abo
 PINCH_IN_FRAMES = 3 # Consecutive frames required to start drag.
 PINCH_OUT_FRAMES = 2 # Consecutive frames required to end drag.
 FIST_THRESHOLD = 0.35 # Maximum average normalized distance between fingertips and their respective base joints to be considered a closed fist. Adjust for camera distance. history: 62 -> 35, 
+FIST_PRECLICK_MARGIN = 0.10 # Block tap clicks while fist score is near the closed-fist threshold.
 DETECTION_BOX_MARGIN_RATIO = 0.08  # Smaller margin means a larger active box.
 ENABLE_LOGGING = False
 SHOW_DEBUG_HUD = True
 # THUMB_VERTICAL_MARGIN = 0.035
 # THUMB_VERTICAL_RATIO = 1.2
+EVENT_HIGHLIGHT_SECONDS = 0.45
+
+THEMES = {
+    "dark": {
+        "panel": (28, 30, 35),
+        "panel_alt": (42, 46, 56),
+        "text": (240, 245, 250),
+        "muted": (165, 175, 188),
+        "accent": (88, 196, 255),
+        "success": (86, 211, 132),
+        "warning": (110, 188, 255),
+        "danger": (118, 112, 245),
+    },
+    "light": {
+        "panel": (242, 246, 252),
+        "panel_alt": (227, 234, 245),
+        "text": (38, 44, 52),
+        "muted": (102, 113, 128),
+        "accent": (223, 136, 36),
+        "success": (73, 168, 89),
+        "warning": (70, 116, 222),
+        "danger": (102, 96, 212),
+    },
+}
 
 
 
@@ -177,6 +202,104 @@ def draw_debug_hud(frame, lines):
         cv2.putText(frame, line, (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 255, 230), 1)
         y += 22
 
+
+def draw_rounded_rect(img, x, y, w, h, radius, color, thickness=-1):
+    radius = max(1, min(radius, min(w, h) // 2))
+    if thickness < 0:
+        cv2.rectangle(img, (x + radius, y), (x + w - radius, y + h), color, -1)
+        cv2.rectangle(img, (x, y + radius), (x + w, y + h - radius), color, -1)
+        cv2.circle(img, (x + radius, y + radius), radius, color, -1)
+        cv2.circle(img, (x + w - radius, y + radius), radius, color, -1)
+        cv2.circle(img, (x + radius, y + h - radius), radius, color, -1)
+        cv2.circle(img, (x + w - radius, y + h - radius), radius, color, -1)
+    else:
+        cv2.line(img, (x + radius, y), (x + w - radius, y), color, thickness)
+        cv2.line(img, (x + radius, y + h), (x + w - radius, y + h), color, thickness)
+        cv2.line(img, (x, y + radius), (x, y + h - radius), color, thickness)
+        cv2.line(img, (x + w, y + radius), (x + w, y + h - radius), color, thickness)
+        cv2.ellipse(img, (x + radius, y + radius), (radius, radius), 180, 0, 90, color, thickness)
+        cv2.ellipse(img, (x + w - radius, y + radius), (radius, radius), 270, 0, 90, color, thickness)
+        cv2.ellipse(img, (x + radius, y + h - radius), (radius, radius), 90, 0, 90, color, thickness)
+        cv2.ellipse(img, (x + w - radius, y + h - radius), (radius, radius), 0, 0, 90, color, thickness)
+
+
+def paste_rounded_image(dst, src, x, y, w, h, radius):
+    resized = cv2.resize(src, (w, h), interpolation=cv2.INTER_LINEAR)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    draw_rounded_rect(mask, 0, 0, w, h, radius, 255, -1)
+    roi = dst[y:y + h, x:x + w]
+    np.copyto(roi, resized, where=(mask[..., None] == 255))
+
+
+def draw_theme_background(canvas, theme_name):
+    theme = THEMES[theme_name]
+    h, w, _ = canvas.shape
+    top = np.array(theme["panel_alt"], dtype=np.float32)
+    bottom = np.array(theme["panel"], dtype=np.float32)
+    grad = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+    bg = (top * (1.0 - grad) + bottom * grad)
+    canvas[:] = np.repeat(bg, w, axis=1).astype(np.uint8)
+
+
+def build_app_frame(camera_frame, theme_name, stats, states):
+    theme = THEMES[theme_name]
+    h, w, _ = camera_frame.shape
+    frame = np.zeros_like(camera_frame)
+    draw_theme_background(frame, theme_name)
+
+    shell_x, shell_y = 22, 20
+    shell_w, shell_h = w - 44, h - 40
+    draw_rounded_rect(frame, shell_x, shell_y, shell_w, shell_h, 24, theme["panel"], -1)
+
+    feed_x = shell_x + 20
+    feed_y = shell_y + 62
+    feed_w = int(shell_w * 0.63)
+    feed_h = shell_h - 88
+    draw_rounded_rect(frame, feed_x, feed_y, feed_w, feed_h, 20, theme["panel_alt"], -1)
+    paste_rounded_image(frame, camera_frame, feed_x + 8, feed_y + 8, feed_w - 16, feed_h - 16, 16)
+
+    panel_x = feed_x + feed_w + 18
+    panel_y = feed_y
+    panel_w = shell_x + shell_w - panel_x - 20
+    panel_h = feed_h
+    draw_rounded_rect(frame, panel_x, panel_y, panel_w, panel_h, 20, theme["panel_alt"], -1)
+
+    title = "Gesture Practice"
+    subtitle = f"Theme: {theme_name.title()}  |  Press T to toggle"
+    cv2.putText(frame, title, (shell_x + 20, shell_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, theme["text"], 2)
+    cv2.putText(frame, subtitle, (shell_x + 20, shell_y + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, theme["muted"], 1)
+
+    card_w = panel_w - 24
+    card_h = 66
+    card_x = panel_x + 12
+    row1_y = panel_y + 12
+    row2_y = row1_y + 76
+    row3_y = row2_y + 76
+    row4_y = row3_y + 76
+    row5_y = row4_y + 76
+
+    cards = [
+        ("Left Click Triggered", stats["left_click"], stats["left_recent"], theme["accent"], card_x, row1_y),
+        ("Right Click Triggered", stats["right_click"], stats["right_recent"], theme["warning"], card_x, row2_y),
+        ("Pinch Triggered", stats["pinch"], stats["pinch_recent"], theme["success"], card_x, row3_y),
+        ("Pause Mouse", stats["pause"], states["pause_active"], theme["danger"], card_x, row4_y),
+    ]
+
+    for label, value, active, color, x, y in cards:
+        draw_rounded_rect(frame, x, y, card_w, card_h, 14, theme["panel_alt"], -1)
+        cv2.putText(frame, label, (x + 12, y + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.48, theme["muted"], 1)
+        cv2.putText(frame, str(value), (x + 12, y + 49), cv2.FONT_HERSHEY_SIMPLEX, 0.9, theme["text"], 2)
+        state_text = "ACTIVE" if active else "IDLE"
+        state_color = color if active else theme["muted"]
+        cv2.putText(frame, state_text, (x + card_w - 90, y + 47), cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_color, 2)
+
+    draw_rounded_rect(frame, card_x, row5_y, card_w, 68, 14, theme["panel_alt"], -1)
+    hand_text = "Hand Detected" if states["hand_visible"] else "No Hand"
+    tracking_text = "Paused" if states["pause_active"] else ("Tracking" if states["hand_visible"] else "Idle")
+    cv2.putText(frame, f"Input: {hand_text}", (card_x + 12, row5_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, theme["text"], 2)
+    cv2.putText(frame, f"Mouse State: {tracking_text}", (card_x + 12, row5_y + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, theme["muted"], 1)
+    return frame
+
 # --- Setup logging ---
 if ENABLE_LOGGING:
     logging.basicConfig(
@@ -220,7 +343,7 @@ logging.info("Starting Air Mouse program...")
 
 # --- Gesture action cooldowns ---
 CLICK_COOLDOWN = 0.3
-FIST_CLICK_SUPPRESSION_SECONDS = 0.2
+FIST_CLICK_SUPPRESSION_SECONDS = 0.35
 last_left_click_time = 0.0
 last_right_click_time = 0.0
 # SCROLL_INTERVAL = 0.05
@@ -232,11 +355,22 @@ pinch_in_count = 0
 pinch_out_count = 0
 prev_index_up = False
 prev_middle_up = False
+pause_count = 0
+left_click_count = 0
+right_click_count = 0
+pinch_trigger_count = 0
+last_left_click_event_time = 0.0
+last_right_click_event_time = 0.0
+last_pinch_event_time = 0.0
+was_fist_active = False
+theme_name = "dark"
 
 while True:
     try:
         ret, frame = cap.read()
         frame_time = time.time()
+        hand_visible = False
+        pause_active = False
         if not ret:
             set_state("no_frame", "Failed to read frame from webcam")
             break
@@ -255,10 +389,13 @@ while True:
         cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
 
         if result.multi_hand_landmarks:
+            hand_visible = True
             hand = result.multi_hand_landmarks[0]
             mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
             gesture_features = get_gesture_features(hand)
             fist_active = is_fist_closed(hand, gesture_features)
+            pause_active = fist_active
+            fist_candidate_active = gesture_features["fist_score"] < (FIST_THRESHOLD + FIST_PRECLICK_MARGIN)
             # thumb_dir = thumb_vertical_direction(hand)
             # non_thumb_fingers_folded = (
             #     (not gesture_features["index_up"])
@@ -270,77 +407,11 @@ while True:
             # scroll_down_active = thumb_dir == 1 and non_thumb_fingers_folded and (not gesture_features["pinch_index_thumb"])
             # scroll_active = scroll_up_active or scroll_down_active
 
-            if SHOW_DEBUG_HUD:
-                margin = max(FINGER_UP_MARGIN, 1e-6)
-
-                index_ext_score_raw = (hand.landmark[6].y - hand.landmark[8].y) / margin
-                middle_ext_score_raw = (hand.landmark[10].y - hand.landmark[12].y) / margin
-                ring_ext_score_raw = (hand.landmark[14].y - hand.landmark[16].y) / margin
-                pinky_ext_score_raw = (hand.landmark[18].y - hand.landmark[20].y) / margin
-
-                index_curl_score_raw = (hand.landmark[8].y - hand.landmark[6].y) / margin
-                middle_curl_score_raw = (hand.landmark[12].y - hand.landmark[10].y) / margin
-                ring_curl_score_raw = (hand.landmark[16].y - hand.landmark[14].y) / margin
-                pinky_curl_score_raw = (hand.landmark[20].y - hand.landmark[18].y) / margin
-
-                index_ext_score = clamp01(index_ext_score_raw)
-                middle_ext_score = clamp01(middle_ext_score_raw)
-                ring_curl_score = clamp01(ring_curl_score_raw)
-                pinky_curl_score = clamp01(pinky_curl_score_raw)
-                index_curl_score = clamp01(index_curl_score_raw)
-                middle_curl_score = clamp01(middle_curl_score_raw)
-
-                pinch_dist = normalized_distance(hand, 4, 8)
-
-                movement_pose = (
-                    gesture_features["index_up"]
-                    and gesture_features["middle_up"]
-                    and not gesture_features["ring_up"]
-                    and not gesture_features["pinky_up"]
-                )
-                left_tap_pose = (
-                    not gesture_features["index_up"]
-                    and gesture_features["middle_up"]
-                    and not gesture_features["ring_up"]
-                    and not gesture_features["pinky_up"]
-                )
-                right_tap_pose = (
-                    gesture_features["index_up"]
-                    and not gesture_features["middle_up"]
-                    and not gesture_features["ring_up"]
-                    and not gesture_features["pinky_up"]
-                )
-
-                movement_score = (index_ext_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-                left_tap_score = (index_curl_score + middle_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-                right_tap_score = (middle_curl_score + index_ext_score + ring_curl_score + pinky_curl_score) / 4.0
-
-                pinch_score = clamp01((PINCH_IN_THRESHOLD - pinch_dist) / max(PINCH_IN_THRESHOLD, 1e-6))
-
-                hud_lines = [
-                    f"move score={movement_score:.2f} active={int(movement_pose)}",
-                    f"left_tap score={left_tap_score:.2f} active={int(left_tap_pose)}",
-                    f"right_tap score={right_tap_score:.2f} active={int(right_tap_pose)}",
-                    # f"thumb_dir={thumb_dir:+d} up={int(scroll_up_active)} down={int(scroll_down_active)}",
-                    f"pinch score={pinch_score:.2f} active={int(gesture_features['pinch_index_thumb'])}",
-                    f"fist score={gesture_features['fist_score']:.2f} active={int(fist_active)}",
-                    f"drag active={int(is_dragging)}",
-                    f"index_ext={index_ext_score_raw:.2f} active={int(gesture_features['index_up'])}",
-                    f"middle_ext={middle_ext_score_raw:.2f} active={int(gesture_features['middle_up'])}",
-                    f"ring_ext={ring_ext_score_raw:.2f} active={int(gesture_features['ring_up'])}",
-                    f"pinky_ext={pinky_ext_score_raw:.2f} active={int(gesture_features['pinky_up'])}",
-                    f"index_curl={index_curl_score_raw:.2f}",
-                    f"middle_curl={middle_curl_score_raw:.2f}",
-                    f"ring_curl={ring_curl_score_raw:.2f}",
-                    f"pinky_curl={pinky_curl_score_raw:.2f}",
-                    f"pinch_dist={pinch_dist:.2f} in={PINCH_IN_THRESHOLD:.2f} out={PINCH_OUT_THRESHOLD:.2f}",
-                    f"pinch_frames in={pinch_in_count}/{PINCH_IN_FRAMES} out={pinch_out_count}/{PINCH_OUT_FRAMES}",
-                    f"fist_thr={FIST_THRESHOLD:.2f}",
-                ]
-                draw_debug_hud(frame, hud_lines)
-
             # --- Check for closed fist ---
             if fist_active:
+                if not was_fist_active:
+                    pause_count += 1
+                was_fist_active = True
                 clicks_suppressed_until = frame_time + FIST_CLICK_SUPPRESSION_SECONDS
                 set_state("fist", "Fist detected - mouse control paused")
                 if is_dragging:
@@ -360,6 +431,7 @@ while True:
                 pinch_dist = gesture_features["pinch_dist"]
                 pinch_enter_ready = pinch_dist < PINCH_IN_THRESHOLD
                 pinch_exit_ready = pinch_dist > PINCH_OUT_THRESHOLD
+                was_fist_active = False
 
                 if not is_dragging:
                     if pinch_enter_ready:
@@ -371,6 +443,8 @@ while True:
                     if pinch_in_count >= PINCH_IN_FRAMES:
                         pyautogui.mouseDown(button="left")
                         is_dragging = True
+                        pinch_trigger_count += 1
+                        last_pinch_event_time = frame_time
                         pinch_in_count = 0
                         pinch_out_count = 0
                         set_state("drag_start", "Pinch detected - drag start")
@@ -402,9 +476,12 @@ while True:
                     and (frame_time - last_left_click_time) >= CLICK_COOLDOWN
                     and not is_dragging
                     and not pinch_candidate_active
+                    and not fist_candidate_active
                     and click_input_allowed
                 ):
                     pyautogui.click(button="left")
+                    left_click_count += 1
+                    last_left_click_event_time = frame_time
                     set_state("left_click", "Index tap detected - left click")
                     last_left_click_time = frame_time
 
@@ -415,9 +492,12 @@ while True:
                     and (frame_time - last_right_click_time) >= CLICK_COOLDOWN
                     and not is_dragging
                     and not pinch_candidate_active
+                    and not fist_candidate_active
                     and click_input_allowed
                 ):
                     pyautogui.click(button="right")
+                    right_click_count += 1
+                    last_right_click_event_time = frame_time
                     set_state("right_click", "Middle tap detected - right click")
                     last_right_click_time = frame_time
 
@@ -524,6 +604,7 @@ while True:
                 prev_index_up = index_up
                 prev_middle_up = middle_up
         else:
+            was_fist_active = False
             if is_dragging:
                 pyautogui.mouseUp(button="left")
                 is_dragging = False
@@ -537,9 +618,30 @@ while True:
             pinch_out_count = 0
             last_positions.clear()
 
+        if SHOW_DEBUG_HUD:
+            stats = {
+                "left_click": left_click_count,
+                "right_click": right_click_count,
+                "pause": pause_count,
+                "pinch": pinch_trigger_count,
+                "left_recent": (frame_time - last_left_click_event_time) <= EVENT_HIGHLIGHT_SECONDS,
+                "right_recent": (frame_time - last_right_click_event_time) <= EVENT_HIGHLIGHT_SECONDS,
+                "pinch_recent": (frame_time - last_pinch_event_time) <= EVENT_HIGHLIGHT_SECONDS,
+            }
+            states = {
+                "pause_active": pause_active,
+                "hand_visible": hand_visible,
+            }
+            app_frame = build_app_frame(frame, theme_name, stats, states)
+        else:
+            app_frame = frame
+
         # --- Display ---
-        cv2.imshow("Air Mouse", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Air Mouse", app_frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('t'):
+            theme_name = "light" if theme_name == "dark" else "dark"
+        if key == ord('q'):
             logging.info("Program terminated by user")
             break
 

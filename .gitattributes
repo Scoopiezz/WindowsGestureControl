@@ -1,0 +1,2 @@
+dist/WindowsGestureControl-v1.0.0.exe filter=lfs diff=lfs merge=lfs -text
+dist/WindowsGestureControlSetup-v1.0.0.exe filter=lfs diff=lfs merge=lfs -text
